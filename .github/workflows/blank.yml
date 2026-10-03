@@ -1,0 +1,128 @@
+name: Build Custom Windows 11 ISO
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+    - name: Checkout Repository
+      uses: actions/checkout@v4
+
+    - name: Download Official Windows 11 ISO (PT-BR)
+      shell: powershell
+      run: |
+        # Baixa a ISO oficial do Windows 11 em Português do Brasil
+        \$isoUrl = "https://microsoft.com"
+        Invoke-WebRequest -Uri \$isoUrl -OutFile "windows11_base.iso" -UserAgent "Mozilla/5.0"
+
+    - name: Extract ISO and Generate Custom Scripts
+      shell: powershell
+      env:
+        TAILSCALE_KEY: \${{ secrets.TAILSCALE_KEY }}
+      run: |
+        # 1. Extrai os arquivos da ISO original
+        New-Item -ItemType Directory -Path "C:\ISO_Extract"
+        \$mountResult = Mount-DiskImage -ImagePath (Get-Item "windows11_base.iso").FullName -Passthru
+        driveLetter = (mountResult | Get-Volume).DriveLetter
+        Copy-Item -Path "\${driveLetter}:\*" -Destination "C:\ISO_Extract" -Recurse -Force
+        Dismount-DiskImage -ImagePath (Get-Item "windows11_base.iso").FullName
+
+        # 2. Cria o arquivo Autounattend.xml dinamicamente para pular as telas do Windows (Idioma PT-BR)
+        \$xmlContent = @"
+        <?xml version="1.0" encoding="utf-8"?>
+        <unattend xmlns="urn:schemas-microsoft-com:unattend">
+          <settings pass="windowsPE">
+            <component name="Microsoft-Windows-International-Core-WinPE" processorArchitecture="amd64" publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS">
+              <SetupUILanguage><UILanguage>pt-BR</UILanguage></SetupUILanguage>
+              <InputLocale>0416:00010416</InputLocale>
+              <SystemLocale>pt-BR</SystemLocale>
+              <UILanguage>pt-BR</UILanguage>
+              <UserLocale>pt-BR</UserLocale>
+            </component>
+            <component name="Microsoft-Windows-Setup" processorArchitecture="amd64" publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS">
+              <UserData>
+                <AcceptProductLicense>true</AcceptProductLicense>
+              </UserData>
+            </component>
+          </settings>
+          <settings pass="oobeSystem">
+            <component name="Microsoft-Windows-Shell-Setup" processorArchitecture="amd64" publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS">
+              <OOBE>
+                <HideEULAPage>true</HideEULAPage>
+                <HideOEMRegistrationScreen>true</HideOEMRegistrationScreen>
+                <HideOnlineAccountScreens>true</HideOnlineAccountScreens>
+                <HideWirelessSetupInOOBE>true</HideWirelessSetupInOOBE>
+                <NetworkLocation>Home</NetworkLocation>
+                <ProtectYourPC>1</ProtectYourPC>
+              </OOBE>
+              <UserAccounts>
+                <LocalAccounts>
+                  <LocalAccount Action="Add">
+                    <Password><Value></Value><PlainText>true</PlainText></Password>
+                    <Description>Usuario Principal</Description>
+                    <DisplayName>User</DisplayName>
+                    <Group>Administrators</Group>
+                    <Name>User</Name>
+                  </LocalAccount>
+                </LocalAccounts>
+              </UserAccounts>
+              <AutoLogon>
+                <Password><Value></Value><PlainText>true</PlainText></Password>
+                <Enabled>true</Enabled>
+                <Username>User</Username>
+              </AutoLogon>
+            </component>
+          </settings>
+        </unattend>
+        "@
+        Set-Content -Path "C:\ISO_Extract\Autounattend.xml" -Value \$xmlContent
+
+        # 3. Cria a pasta interna de scripts nativos do instalador do Windows
+        New-Item -ItemType Directory -Path "C:\ISO_Extract\sources\`\$OEM\`$\`\$\Setup\Scripts" -Force
+
+        # 4. Escreve o script PowerShell que configura os seus programas e o Wallpaper
+        \$psScript = @"
+        `$ProgressPreference = 'SilentlyContinue'
+        
+        # Garante idioma e layout de teclado ABNT2
+        Set-WinSystemLocale -SystemLocale pt-BR
+        Set-WinUserLanguageList -LanguageList (New-WinUserLanguageList -Language pt-BR) -Force
+        Set-Culture pt-BR
+
+        # Instalação silenciosa do Discord via Winget
+        winget source update
+        winget install --id Discord.Discord --exact --silent --accept-source-agreements --accept-package-agreements
+
+        # Instalação e login automático do Tailscale com a sua chave
+        Invoke-WebRequest -Uri "https://tailscale.com" -OutFile "C:\Windows\Temp\tailscale.msi"
+        Start-Process msiexec.exe -ArgumentList "/i C:\Windows\Temp\tailscale.msi /qn /norestart" -Wait
+        & "C:\Program Files\Tailscale\tailscale.exe" up --authkey=$env:TAILSCALE_KEY --unattended
+
+        # Baixa o Wallpaper do Dragon Ball (Link direto do Imgur)
+        `\$wallpaperUrl = "https://imgur.com"
+        `$wallpaperPath = "C:\Windows\Web\Wallpaper\dragonball.jpg"
+        Invoke-WebRequest -Uri `\$wallpaperUrl -OutFile `$wallpaperPath
+
+        # Aplica o papel de parede no Registro do Windows
+        Set-ItemProperty -Path 'HKCU:\Control Panel\Desktop' -Name Wallpaper -Value `\$wallpaperPath
+        rundll32.exe user32.dll,UpdatePerUserSystemParameters
+        "@
+        Set-Content -Path "C:\ISO_Extract\sources\`$OEM\`\$\`$\Setup\Scripts\SetupComplete.ps1" -Value $psScript
+
+        # 5. Cria o gatilho de execução automática do Windows (.cmd)
+        Set-Content -Path "C:\ISO_Extract\sources\`\$OEM\`$\`\$\Setup\Scripts\SetupComplete.cmd" -Value "Powershell -ExecutionPolicy Bypass -File C:\Windows\Setup\Scripts\SetupComplete.ps1"
+
+    - name: Compile Custom Bootable ISO
+      shell: cmd
+      run: |
+        # Gera a ISO final utilizando a ferramenta oficial do Windows SDK embutida no GitHub Actions
+        "C:\Program Files (x86)\Windows Kits\10\Assessment and Deployment Kit\Deployment Tools\amd64\Oscdimg\oscdimg.exe" -bC:\ISO_Extract\boot\etfsboot.com -pDF -u2 -h -m C:\ISO_Extract\ Windows11-Custom.iso
+
+    - name: Upload ISO Artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: Windows11-Personalizado
+        path: Windows11-Custom.iso
+        retention-days: 3
