@@ -1,0 +1,123 @@
+name: Build Custom Windows 11 ISO
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+    - name: Checkout Repository
+      uses: actions/checkout@v4
+
+    - name: Download Official Windows 11 ISO (PT-BR)
+      shell: powershell
+      run: |
+        \$isoUrl = "https://microsoft.com"
+        Invoke-WebRequest -Uri \$isoUrl -OutFile "windows11_base.iso" -UserAgent "Mozilla/5.0"
+
+    - name: Download Microsoft Oscdimg Tool
+      shell: powershell
+      run: |
+        # Baixa o utilitário oficial de fechar ISOs da Microsoft necessário para o ambiente do GitHub
+        New-Item -ItemType Directory -Path "C:\adk" -Force
+        Invoke-WebRequest -Uri "https://go.microsoft.com/fwlink/?linkid=2289980" -OutFile "C:\adk\adksetup.exe"
+        Start-Process "C:\adk\adksetup.exe" -ArgumentList "/features OptionId.DeploymentTools /quiet /norestart" -Wait
+
+    - name: Extract ISO and Ingest Setup Files
+      shell: powershell
+      env:
+        TAILSCALE_KEY: \${{ secrets.TAILSCALE_KEY }}
+      run: |
+        # 1. Cria diretório de trabalho
+        New-Item -ItemType Directory -Path "C:\ISO_Extract" -Force
+        
+        # 2. Monta e extrai a ISO base
+        \$mountResult = Mount-DiskImage -ImagePath (Get-Item "windows11_base.iso").FullName -Passthru
+        driveLetter = (mountResult | Get-Volume).DriveLetter
+        Copy-Item -Path "\${driveLetter}:\*" -Destination "C:\ISO_Extract" -Recurse -Force
+        Dismount-DiskImage -ImagePath (Get-Item "windows11_base.iso").FullName
+
+        # 3. Cria a estrutura exata do instalador OEM do Windows para scripts automáticos
+        \(ScriptDir = "C:\ISO_Extract\sources\`\)OEM\`$\Setup\Scripts"
+        New-Item -ItemType Directory -Path $ScriptDir -Force
+
+        # 4. Escreve o arquivo de instalação limpa automática na raiz (Autounattend.xml)
+        @"
+        <?xml version="1.0" encoding="utf-8"?>
+        <unattend xmlns="urn:schemas-microsoft-com:unattend">
+          <settings pass="windowsPE">
+            <component name="Microsoft-Windows-International-Core-WinPE" processorArchitecture="amd64" publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS">
+              <SetupUILanguage><UILanguage>pt-BR</UILanguage></SetupUILanguage>
+              <InputLocale>0416:00010416</InputLocale>
+              <SystemLocale>pt-BR</SystemLocale>
+              <UILanguage>pt-BR</UILanguage>
+              <UserLocale>pt-BR</UserLocale>
+            </component>
+            <component name="Microsoft-Windows-Setup" processorArchitecture="amd64" publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS">
+              <UserData><AcceptProductLicense>true</AcceptProductLicense></UserData>
+            </component>
+          </settings>
+          <settings pass="oobeSystem">
+            <component name="Microsoft-Windows-Shell-Setup" processorArchitecture="amd64" publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS">
+              <OOBE>
+                <HideEULAPage>true</HideEULAPage>
+                <HideOEMRegistrationScreen>true</HideOEMRegistrationScreen>
+                <HideOnlineAccountScreens>true</HideOnlineAccountScreens>
+                <HideWirelessSetupInOOBE>true</HideWirelessSetupInOOBE>
+                <NetworkLocation>Home</NetworkLocation>
+                <ProtectYourPC>1</ProtectYourPC>
+              </OOBE>
+              <UserAccounts>
+                <LocalAccounts>
+                  <LocalAccount Action="Add">
+                    <Password><Value></Value><PlainText>true</PlainText></Password>
+                    <DisplayName>User</DisplayName>
+                    <Group>Administrators</Group>
+                    <Name>User</Name>
+                  </LocalAccount>
+                </LocalAccounts>
+              </UserAccounts>
+              <AutoLogon>
+                <Password><Value></Value><PlainText>true</PlainText></Password>
+                <Enabled>true</Enabled>
+                <Username>User</Username>
+              </AutoLogon>
+            </component>
+          </settings>
+        </unattend>
+        "@ | Set-Content -Path "C:\ISO_Extract\Autounattend.xml" -Encoding UTF8
+
+        # 5. Cria o Script PowerShell final injetando a sua chave secreta com segurança
+        $tsKey = $env:TAILSCALE_KEY
+        $psContent = @"
+        `\$ProgressPreference = 'SilentlyContinue'
+        Set-WinSystemLocale -SystemLocale pt-BR
+        Set-WinUserLanguageList -LanguageList (New-WinUserLanguageList -Language pt-BR) -Force
+        Set-Culture pt-BR
+        winget source update
+        winget install --id Discord.Discord --exact --silent --accept-source-agreements --accept-package-agreements
+        Invoke-WebRequest -Uri "https://tailscale.com" -OutFile "C:\Windows\Temp\tailscale.msi"
+        Start-Process msiexec.exe -ArgumentList "/i C:\Windows\Temp\tailscale.msi /qn /norestart" -Wait
+        & "C:\Program Files\Tailscale\tailscale.exe" up --authkey=\$tsKey --unattended
+        Invoke-WebRequest -Uri "https://imgur.com" -OutFile "C:\Windows\Web\Wallpaper\dragonball.jpg"
+        Set-ItemProperty -Path 'HKCU:\Control Panel\Desktop' -Name Wallpaper -Value "C:\Windows\Web\Wallpaper\dragonball.jpg"
+        rundll32.exe user32.dll,UpdatePerUserSystemParameters
+        "@
+        Set-Content -Path "\(ScriptDir\SetupComplete.ps1" -Value \)psContent -Encoding UTF8
+
+        # 6. Cria o arquivo gatilho (.cmd) que aciona o PowerShell no final da formatação
+        Set-Content -Path "\$ScriptDir\SetupComplete.cmd" -Value "Powershell -ExecutionPolicy Bypass -File C:\Windows\Setup\Scripts\SetupComplete.ps1" -Encoding ASCII
+
+    - name: Compile Custom Bootable ISO
+      shell: cmd
+      run: |
+        # Executa o Oscdimg a partir da pasta padrão de instalação do Windows ADK
+        "C:\Program Files (x86)\Windows Kits\10\Assessment and Deployment Kit\Deployment Tools\amd64\Oscdimg\oscdimg.exe" -bC:\ISO_Extract\boot\etfsboot.com -pDF -u2 -h -m C:\ISO_Extract\ Windows11-Custom.iso
+
+    - name: Upload ISO Artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: Windows11-Personalizado
+        path: Windows11-Custom.iso
+        retention-days: 2
